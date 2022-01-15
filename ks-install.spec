@@ -1,8 +1,13 @@
 %global forgeurl https://github.com/cmadamsgit/ks-install
-%global commit TBD
+%global commit e04eaa270414e2de98f2266020be60641b5db888
 %forgemeta
 
+Name:		ks-install
+Summary:	Take a Fedora/CentOS/RHEL kickstart file and make a VM
+Version:	0
 Release:	0.1%{?dist}
+URL:		%{forgeurl}
+Source:		%{forgesource}
 License:	GPLv3
 BuildArch:	noarch
 BuildRequires:	perl-generators perl-podlators
