@@ -1,5 +1,5 @@
 %global forgeurl https://github.com/cmadamsgit/ks-install
-%global commit e04eaa270414e2de98f2266020be60641b5db888
+%global commit SETME
 %forgemeta
 
 Name:		ks-install
@@ -33,5 +33,5 @@ install -D -m0644 ks-libvirt.1 %{buildroot}%{_mandir}/man1/ks-libvirt.1
 %{_mandir}/man*/*
 
 %changelog
-* Fri Jan 14 2022 Chris Adams <linux@cmadams.net> 1-1
+* Fri Jan 14 2022 Chris Adams <linux@cmadams.net> 0-0.1-8a82a6017a00b023c111e573f45e86d65e7593f9
 - initial package
