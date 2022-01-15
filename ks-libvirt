@@ -1,0 +1,827 @@
+#!/usr/bin/perl
+#
+# Take a Fedora/CentOS/RHEL kickstart file and make a VM
+#
+#########################################################################
+# Copyright (C) 2022 by Chris Adams <linux@cmadams.net>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# version 3 as published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#########################################################################
+#
+# Requirements (on CentOS/RHEL, some of these are from PowerTools/CRB repos
+# and Fedora EPEL):
+# dnf install virt-install perl\({Modern::Perl,Config::Tiny,Getopt::Long,Pod::Usage,autodie,Socket,LWP::Simple,LWP::Protocol::https,XML::Simple,Sys::Virt,File::Temp,POSIX}\)
+# - also needs swtpm-tools for TPM device in VM
+#
+# History:
+# 1.0 - 2022-01-05 - cmadams
+#	first release version, script goes back years
+#
+
+use Modern::Perl qw(2018);
+use Config::Tiny;
+use Getopt::Long qw(:config bundling no_auto_abbrev no_ignore_case);
+use Pod::Usage;
+use autodie;
+use Socket qw(inet_ntoa inet_pton AF_INET);
+use LWP::Simple;
+use LWP::Protocol::https;
+use XML::Simple qw(:strict);
+use Sys::Virt;
+use File::Temp qw(tempfile tempdir);
+use POSIX qw(strftime);
+
+# Base defaults - order settings are applied is (stop at first match):
+# - command-line options
+# - kickstart tags
+# - config file (either $HOME/.virtinst.cf or from --config CLI argument)
+# - these defaults
+my %defaults = (
+	addga => 1,
+	cpu => 1,
+	disk => 6,
+	dns => join (",", default_dns ()),
+	libvirt => $ENV{"VIRSH_DEFAULT_CONNECT_UID"} || "qemu:///system",
+	mapfile => $ENV{"HOME"} . "/.virtinst-map",
+	net => default_net (),
+	os => "detect=on,require=on",
+	pool => "default",
+	ram => 2048,
+	serial => 1,
+	ssh => 1,
+);
+
+# Handle command-line options
+my (%opts, %cliopt);
+# - simple options (boolean/single value)
+foreach my $arg (qw(
+	addga|a!
+	anaconda|A=s
+	cpu|c=i
+	disk2=f
+	disk|d=f
+	dns=s
+	dumpks|D!
+	gw=s
+	hostname|h=s
+	ip=s
+	iso|i=s
+	libvirt|l=s
+	mapfile|m=s
+	name|n=s
+	net|N=s
+	off|O!
+	os|o=s
+	pool|p=s
+	quiet|q!
+	ram|r=i
+	screen|s!
+	serial|S!
+	ssh!
+	tpm!
+	uefi|u!
+	vdelete!
+	verbose|v!
+    )) {
+	my ($long) = $arg =~ /^([a-z0-9]+)/;
+	$cliopt{$long} = undef;
+	$opts{$arg} = \$cliopt{$long};
+}
+# - list/multi options
+foreach my $arg (qw(
+	virtinst|V=s
+    )) {
+	my ($long) = $arg =~ /^([a-z0-9]+)/;
+	$cliopt{$long} = [];
+	$opts{$arg} = $cliopt{$long};
+}
+
+# Get the options
+GetOptions (
+    'help|?' => \(my $help),
+    'config|C=s' => \(my $cffile = $ENV{"HOME"} . "/.virtinst.cf"),
+    %opts,
+) or pod2usage (2);
+pod2usage (1) if ($help);
+
+# Read the config file
+my %fileopt;
+if (-e $cffile) {
+	my $cf = Config::Tiny->read ($cffile);
+	my $fileopt = $cf->{"_"};
+	%fileopt = %$fileopt;
+}
+
+# serial console? list both, but the last one is what anaconda will use
+my $serial = 'console=tty0 console=ttyS0,115200' if (opt ("serial"));
+
+# read the base file and handle includes up front
+my $ks = shift or pod2usage ("Must supply KS file");
+(my $ksname = $ks) =~ s!.*/!!;
+my @ks = load_file ($ks);
+my $ksinc = 1;
+while ($ksinc) {
+	$ksinc = 0;
+	foreach my $line (@ks) {
+		if ($line =~ /^#include:(\S+)/) {
+			$ksinc = 1;
+			$line = join ("", load_file ($1));
+		}
+	}
+	@ks = map {$_ . "\n"} split (/\n/, join ("", @ks));
+}
+
+my $name = opt ("name");
+if (! $name) {
+	if (opt ("hostname")) {
+		($name = opt ("hostname")) =~ s/\..*//;
+	} else {
+		($name = $ksname) =~ s/^ks-//;
+	}
+}
+my $quiet = opt ("quiet");
+$quiet = 1 if (! defined ($quiet) && opt ("dumpks"));
+
+# find SSH keys to plug in
+my @sshkey;
+if (opt ("ssh")) {
+	if ($ENV{"SSH_AGENT_PID"}) {
+		open (my $sshadd, "-|", qw(ssh-add -L));
+		@sshkey = map {chomp; $_} <$sshadd>;
+		close ($sshadd);
+	}
+	foreach my $key (glob ($ENV{"HOME"} . "/.ssh/id*.pub")) {
+		my $kh;
+		open ($kh, "<", $key) and do {
+			my $key = <$kh>;
+			if ($key =~ /^[a-z]/) {
+				chomp $key;
+				push @sshkey, $key;
+			}
+			close ($kh);
+		};
+	}
+}
+
+# Set network info (rather than DHCP)
+my $netset;
+my @netinf = (("") x 7);
+die "Must specify IP and netmask together\n" if (opt ("ip") xor opt ("gw"));
+if (opt ("ip")) {
+	my ($i, $bits) = split (/\//, opt ("ip"));
+	die "Invalid IP ", opt ("ip"), " (expects x.x.x.x/x)\n" if (! $bits);
+	my $ip = $i;
+	die "Invalid IP \"$ip\"\n" if (! inet_pton (AF_INET, $ip));
+	die "Invalid prefix length \"$bits\"\n" if (($bits !~ /^\d+$/) ||
+	    ($bits < 1) || ($bits > 31));
+	my $mask = inet_ntoa (pack ("B*", "1" x $bits . "0" x (32 - $bits)));
+	$netinf[0] = $ip;
+	$netinf[3] = $mask;
+	$netset = 1;
+}
+if (opt ("gw")) {
+	$netinf[2] = opt ("gw");
+}
+$netinf[4] = opt ("hostname") if (opt ("hostname"));
+
+# Go through the kickstart file and check/change some things
+my ($url, $cdrom, %kscfg);
+my %tags = map {$_ => 1} qw(CPU DISK DISK2 ISO OS RAM SSH TPM UEFI);
+foreach my $line (@ks) {
+	if (my ($tag, $val) = $line =~ /^#([A-Z0-9]+):(\S.*)$/) {
+		# Save tags to override defaults (but command-line
+		# overrides these)
+		if ($tags{$tag}) {
+			$tag = lc ($tag);
+		} elsif (($tag =~ /^NO(.+)/) && $tags{$1}) {
+			$tag = lc ($1);
+			$val = 0;
+		} else {
+			die "Unknown tag in kickstart\n", $line, "\n";
+		}
+		$kscfg{$tag} = $val;
+	} elsif ($line =~ /^url /) {
+		# This may be an install source, also map to local repos
+		my $uchange = 0;
+		if ($line =~ / --url=(\S+)/) {
+			$url = $1;
+		} elsif ($line =~ / --mirrorlist=(\S+)/) {
+			if (! ($url = mapurl ($1))) {
+				msg ("Fetching mirrorlist");
+				($url) = grep {/^http/} split (/\n/, get ($1));
+			} else {
+				$uchange = 1;
+			}
+		} elsif ($line =~ / --metalink=(\S+)/) {
+			if (! ($url = mapurl ($1))) {
+				msg ("Fetching metalink");
+				my $xml = XMLin (get ($1), KeyAttr => {},
+				    ForceArray => ["url"]);
+				foreach my $ent (@{$xml->{"files"}->{"file"}->
+				    {"resources"}->{"url"}}) {
+					if ($ent->{"protocol"} =~ /^http/) {
+						$url = $ent->{"content"};
+						$url =~ s!/repodata/.*!/!;
+						last;
+					}
+				}
+			} else {
+				$uchange = 1;
+			}
+		}
+		if ($uchange) {
+			$line = "url --url=" . $url . "\n";
+		}
+	} elsif ($line =~ /^repo /) {
+		# Map to local repos
+		if ($line =~ /(.+ )--(?:baseurl|mirrorlist|metalink)=(\S+)(.*)/) {
+			if (my $u = mapurl ($2)) {
+				$line = $1 . "--baseurl=" . $u . $3 . "\n";
+			}
+		}
+	} elsif (opt ("addga") && ($line =~ /^%packages/)) {
+		msg ("Adding guest agent package");
+		$line .= "qemu-guest-agent\n";
+	} elsif (opt ("ssh") && @sshkey && ($line =~ /^rootpw/)) {
+		msg ("Adding SSH keys");
+		foreach my $key (@sshkey) {
+			$line .= "sshkey --username=root \"" . $key . "\"\n";
+		}
+	} elsif ($line =~ /^cdrom/) {
+		$cdrom = 1;
+	} elsif ($serial && ($line =~ /^bootloader /)) {
+		# anaconda will configure the installed system to only
+		# use the last console= option from the command line, so
+		# add them both to the bootloader line
+		chomp $line;
+		msg ("Adding serial console");
+		$line .= " --append=\"" . $serial . "\"\n";
+	} elsif ($netset && ($line =~ /^(network .*)--bootproto=dhcp(.*)/)) {
+		# replace DHCP line with static IP info
+		msg ("Adding network config");
+		$line = $1 . "--noipv6 --bootproto=static" .
+		    " --ip=" . $netinf[0] .
+		    " --netmask=" . $netinf[3] .
+		    " --gateway=" . $netinf[2] .
+		    " --nameserver=" . opt ("dns") .
+		    $2 . "\n";
+	}
+}
+if (opt ("hostname")) {
+	unshift @ks, "network --hostname=" . opt ("hostname") . "\n";
+	# anaconda doesn't set the hostname for DHCP until after installing the
+	# system, so install-time things see localhosthost.localdomain
+	# https://bugzilla.redhat.com/show_bug.cgi?id=1975349
+	unshift @ks, "%pre --interpreter=/bin/bash\n",
+	    "hostnamectl set-hostname \"" . opt ("hostname") . "\"\n", "%end\n";
+}
+
+if (opt ("dumpks")) {
+	print @ks;
+	exit;
+}
+my $virt = Sys::Virt->new (uri => opt ("libvirt"));
+
+# Handle an ISO in a pool - have to download a local copy for virt-install
+my $iso = opt ("iso");
+if ($iso && ! -f $iso) {
+	(my $ipool, $iso) = split (/\//, $iso, 2);
+	if (! $iso) {
+		$iso = $ipool;
+		$ipool = opt ("pool");
+	}
+	msg ("Fetching ISO for virt-install");
+	my $p = $virt->get_storage_pool_by_name ($ipool);
+	my $v = $p->get_volume_by_name ($iso);
+	my $isodir = tempdir (CLEANUP => 1);
+	# - has to be world-readable (well, at least qemu:qemu)
+	chmod (0755, $isodir);
+	my $itmp = $isodir . "/" . $iso;
+	open (my $fh, ">", $itmp);
+	chmod (0644, $itmp);
+	my $st = $virt->new_stream;
+	$v->download ($st, 0, 0);
+	while (1) {
+		my $r = $st->recv (my $data, 4096);
+		last if ($r == 0);
+		while ($r > 0) {
+			my $rw = syswrite ($fh, $data, $r);
+			if ($rw) {
+				$data = substr ($data, $rw);
+				$r -= $rw;
+			}
+		}
+	}
+	close ($fh);
+	$iso = $itmp;
+}
+
+# Figure the install source and add the kickstart
+my @source;
+if ($iso) {
+	@source = ("--location", $iso);
+} elsif ($url) {
+	@source = ("--location", $url);
+	if ($url =~ /^https/) {
+		push @source, "--extra-args", "inst.noverifyssl";
+	}
+} elsif ($cdrom) {
+	die "CD install specified but no ISO path\n";
+} else {
+	die "No installation source found\n";
+}
+my $ksdir = tempdir (CLEANUP => 1);
+my $ksf = $ksdir . "/ks.cfg";
+open (my $ksfh, ">", $ksf);
+print $ksfh @ks;
+close ($ksfh);
+
+# Build anaconda command-line options
+my $anaextra = opt ("anaconda") // "";
+$anaextra = " " . $anaextra if ($anaextra);
+$anaextra .= " " . $serial if ($serial);
+$anaextra .= " ip=" . join (":", @netinf) if ($netset);
+$anaextra .= " nameserver=" . opt ("dns") if ($netset);
+push @source, "--initrd-inject", $ksf,
+    "--extra-args", "inst.ks=file:/ks.cfg" . $anaextra;
+
+# Delete existing VM and disks
+if (my $vm = eval {$virt->get_domain_by_name ($name)}) {
+	die "VM $name already exists\n" if (! opt ("vdelete"));
+
+	my $vminf = XMLin ($vm->get_xml_description, KeyAttr => {},
+	    ForceArray => [qw(disk)]);
+	if ($vm->is_active) {
+		msg ("Shutting down existing VM");
+		$vm->destroy;
+	}
+	msg ("Removing existing VM");
+	$vm->undefine (Sys::Virt::Domain::UNDEFINE_NVRAM);
+
+	foreach my $dev (@{$vminf->{"devices"}->{"disk"}}) {
+		next if (! $dev->{"source"}->{"file"});
+		next if ($dev->{"device"} eq "cdrom");
+		my ($path, $file) = $dev->{"source"}->{"file"} =~ m!(.+)/([^/]+)$!;
+		my $p = $virt->get_storage_pool_by_target_path ($path);
+		my $v = eval {$p->get_volume_by_name ($file)};
+		$v->delete if ($v);
+	}
+}
+
+# want a second disk too?
+my @disk2 = ();
+if (opt ("disk2")) {
+    @disk2 = ("--disk", "pool=" . opt ("pool") . ",path=" . $name
+        . "-2.qcow2,driver.discard=unmap,size=" . opt ("disk2"));
+}
+
+# extra boot config
+my @boot = ();
+push @boot, "uefi" if (opt ("uefi"));
+push @boot, "bios.useserial=on" if ($serial);
+@boot = ("--boot", join (",", @boot)) if (@boot);
+
+# Do it! Always power off when done to know when it's finished
+my @cmd = ("virt-install",
+    "--connect", opt ("libvirt"),
+    "--name", $name,
+    "--memory", opt ("ram"),
+    "--vcpus", opt ("cpu"),
+    "--security", "type=dynamic",
+    "--os-variant", opt ("os"),
+    @source,
+    "--disk", "pool=" . opt ("pool") . ",path=" . $name . ".qcow2,driver.discard=unmap,size=" . opt ("disk"),
+    @disk2,
+    "--network", "bridge=" . opt ("net"),
+    "--watchdog", "default",
+    "--memballoon", "virtio",
+    "--rng", "/dev/urandom",
+    "--panic", "default",
+    "--noreboot",
+    @boot,
+);
+push @cmd, "--quiet" if (! opt ("verbose"));
+push @cmd, "--tpm", "emulator" if (opt ("tpm"));
+if (opt ("screen")) {
+	push @cmd, "--autoconsole", "text" if ($serial);
+} else {
+	push @cmd, "--noautoconsole", "--wait";
+}
+push @cmd, @{opt ("virtinst")};
+msg ("Installing");
+my $istart = time;
+system (@cmd);
+die "virt-install failed\n" if (($? >> 8) != 0);
+my $itook = time - $istart;
+msg ("Took ", int ($itook / 60), ":", sprintf ("%02s", $itook % 60));
+
+exit if (opt ("off"));
+
+# Start the VM, then exit if we excluded the guest agent
+my $vm = $virt->get_domain_by_name ($name);
+my $vminf = XMLin ($vm->get_xml_description, KeyAttr => {},
+    ForceArray => [qw(disk interface)]);
+msg ("Starting VM");
+$vm->create;
+exit if (! opt ("addga"));
+
+# Wait for the IP to register
+msg ("Waiting for boot");
+# - find the bridged MAC
+my $mac;
+foreach my $if (@{$vminf->{"devices"}->{"interface"}}) {
+	next if ($if->{"type"} ne "bridge");
+	next if ($if->{"source"}->{"bridge"} ne opt ("net"));
+	$mac = $if->{"mac"}->{"address"};
+	last;
+}
+my $vmip;
+while (! $vmip && sleep (1)) {
+	my @nics = eval {$vm->get_interface_addresses (Sys::Virt::Domain::INTERFACE_ADDRESSES_SRC_AGENT)};
+	NIC: foreach my $nic (@nics) {
+		next if (! $nic->{"hwaddr"} || ($nic->{"hwaddr"} ne $mac));
+		foreach my $addr (@{$nic->{"addrs"}}) {
+			next if ($addr->{"type"} != 0);
+			$vmip = $addr->{"addr"};
+			last NIC;
+		}
+	}
+}
+# - get SSH ready to go
+my $sshgen = fork;
+if (! $sshgen) {
+	open (STDOUT, ">", "/dev/null") if (! opt ("verbose"));
+	open (STDERR, ">", "/dev/null") if (! opt ("verbose"));
+	exec ("ssh-keygen", "-R", $vmip);
+}
+waitpid ($sshgen, 0);
+while (1) {
+	my $sshscan = fork;
+	if (! $sshscan) {
+		open (STDOUT, ">>", $ENV{"HOME"} . "/.ssh/known_hosts");
+		open (STDERR, ">", "/dev/null") if (! opt ("verbose"));
+		exec ("ssh-keyscan", $vmip);
+	}
+	waitpid ($sshscan, 0);
+	last if (($? >> 8) == 0);
+	sleep (1);
+}
+print $vmip, "\n";
+
+
+# Find the default bridge
+sub default_net
+{
+	# find the device for the default route
+	open (my $db_rt, "-|", qw(ip -o route list 0.0.0.0/0));
+	my ($net) = map {/ dev (\S+)/ && $1} <$db_rt>;
+	close ($db_rt);
+
+	# check that it's a bridge
+	open (my $db_link, "-|", qw(bridge -o link show));
+	my @db_br = grep {/ master (\S+)/ && ($net && ($1 eq $net))} <$db_link>;
+	$net = "" if (! @db_br);
+	close ($db_link);
+
+	return $net;
+}
+
+
+# Get the local DNS server(s) from NetworkManager
+sub default_dns
+{
+	# Assumes NetworkManager in use, tries to parse the output
+	open (my $nm, "-|", "nmcli");
+	my @dns;
+	my $indns;
+	while (<$nm>) {
+		if (/^DNS configuration:/) {
+			$indns = 1;
+		} elsif (/^\S/) {
+			$indns = 0;
+		}
+		next if (! $indns);
+
+		if (/servers: (.+)/) {
+			push @dns, split (/[, ]/, $1);
+		}
+	}
+	close ($nm);
+	# make this IPv4 only for now
+	@dns = grep {/\./} @dns;
+	return @dns;
+}
+
+
+# Read a file (could be remote)
+sub load_file
+{
+	my $file = shift;
+
+	# keep track of the base, load other things relative to it
+	state $base;
+	if (! $base && ($file =~ /^(.*\/)[^\/]+$/)) {
+		$base = $1;
+	}
+
+	if ($file =~ /^https?:\/\//) {
+		my $d = get ($file);
+		return map {$_ . "\n"} split (/\n/, $d);
+	} else {
+		my $f;
+		if (-e $file) {
+			open ($f, "<", $file);
+		} elsif ($base) {
+			open ($f, "<", $base . "/" . $file);
+		} else {
+			# whatever
+			open ($f, "<", $file);
+		}
+		my @d = <$f>;
+		close ($f);
+		return @d;
+	}
+}
+
+
+# Look up an option from the various sources (applied in the right order)
+sub opt
+{
+	my $key = shift;
+
+	return $cliopt{$key} // $kscfg{$key} // $fileopt{$key} // $defaults{$key};
+}
+
+
+# Map URLs to local/preferred sources
+sub mapurl
+{
+	my $in = shift;
+
+	state %map;
+	if (! $map{"__read__"}) {
+		$map{"__read__"} = 1;
+		if (-e opt ("mapfile")) {
+			open (my $mh, "<", opt ("mapfile"));
+			while (<$mh>) {
+				if (/^(http\S+)\s+(http\S+)/) {
+					$map{$1} = $2;
+				}
+			}
+			close ($mh);
+		}
+	}
+
+	if ($in =~ m!(.*[/=-]f?)([\d.]+)(.*)!) {
+		my $in2 = $1 . '$releasever' . $3;
+		my $ver = $2;
+		if (my $m2 = $map{$in2}) {
+			$m2 =~ s/\$releasever/$ver/g;
+			$map{$in} = $m2;
+		}
+	}
+
+	if ($map{$in}) {
+		msg ("Mapping URL to ", $map{$in});
+		return $map{$in};
+	}
+}
+
+
+# Print time-stamped messages
+sub msg
+{
+	return if ($quiet);
+	my $now = strftime ("%H:%M:%S", localtime (time));
+	state $last;
+	if (! $last || ($now ne $last)) {
+		print STDERR $now;
+		$last = $now;
+	} else {
+		print STDERR " " x length ($now);
+	}
+	print STDERR " ", @_, "\n";
+}
+
+
+=pod
+
+=head1 NAME
+
+ks-libvirt - Take a Fedora/CentOS/RHEL kickstart file and make a VM
+
+=head1 SYNOPSIS
+
+ks-libvirt [options] F<kickstart-file>
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--addga | -a>
+
+Add qemu-guest-agent to %packages; default is to do this, use B<--noaddga> to
+disable. Without the agent, the hypvervisor cannot get the IP of the VM (or do
+other VM management).
+
+=item B<--anaconda | -A> I<arguments>
+
+Additional anaconda boot arguments
+
+=item B{--config | -C> F<config>
+
+Config file for defaults; default is $HOME/.virtinst.cf
+
+=item B<--cpu | -c> I<count>
+
+VM CPU cores; default is 1
+
+=item B<--disk | -d> I<GB>
+
+VM disk size in gigabytes; default is 6
+
+=item B<--disk2> I<GB>
+
+VM second disk size in gigabytes; default is to not use a second disk (this is
+mostly just useful for testing kickstart RAID handling)
+
+=item B<--dns> I<DNS-IPs>
+
+Set the DNS server(s) (comma separated); default: copy host DNS config when
+IPv4 address is set
+
+=item B<--dumpks | -D>
+
+Generate a modified kickstart file and dump to standard out (don't build VM)
+
+=item B<--gw> I<IPv4-gateway>
+
+Set the IPv4 gateway
+
+=item B<--hostname | -h> I<FQDN>
+
+Set the hostname; default is to not set unless network is set, then use the
+VM name
+
+=item B<--ip> I<IPv4-address/mask>
+
+Set the IPv4 address and netmask (in bits, e.g. 10.0.0.1/24); default is to try
+DHCP (if network needed)
+
+=item B<--iso | -i> F<ISO>
+
+ISO to boot from; default is pulled from KS or to use URL instead.  Handles a
+local ISO file (will be uploaded to same pool as VM storage if needed), or
+F<pool/volume> for an ISO already in a storage pool.
+
+=item B<--libvirt | -l> I<URL>
+
+Connection to libvirt; default is $VIRTSH_DEFAULT_CONNECT_UID or qemu:///system
+
+=item B<--mapfile | -m> F<file>
+
+URL map file to use different source repos.  The format of the file is one
+entry per line with a pair of URLs separated by a space.  The first URL is the
+original (which can be a mirrorlist or metalink) followed by a target URL to
+replace it with (mirrorlist/metalink are turned into direct url entries).  The
+default is F<$HOME/.virtinst-map>
+
+=item B<--name | -n> I<name>
+
+VM name; default is KS file name minus any leading "ks-"
+
+=item B<--net | -N> I<interface>
+
+Bridge network interface to attach to; default is interface with default route
+
+=item B<--off | -O>
+
+Leave the VM off at the end of install
+
+=item B<--pool | -p> I<pool>
+
+Storage pool name; use pool I<default> by default
+
+=item B<--os | -o> I<OS>
+
+OS name, used to set VM hardware config; default is autodetect
+
+=item B<--quiet | -q>
+
+Be very quiet - only show errors and IP at end
+
+=item B<--ram | -r> I<MB>
+
+VM RAM size in megabytes; default is 2048 unless specified in the KS
+
+=item B<--screen | -s>
+
+Open the VM console screen during install
+
+=item B<--serial | -S>
+
+Add a serial console; default is to do this, use B<--noserial> to disable
+
+=item B<--ssh>
+
+Add found SSH key(s) to the installed system; default is to do this, use
+B<--nossh> to disable
+
+=item B<--tpm>
+
+Add TPM device
+
+=item B<--uefi | -u>
+
+Use UEFI boot instead of BIOS
+
+=item B<--vdelete>
+
+Delete an existing VM with the same name before creating new (B<NOTE>: will not
+ask for confirmation!)
+
+=item B<--verbose | -v>
+
+Be more verbose
+
+=item B<--virtinst | -V> I<arguments>
+
+Additional virt-install arguments (can be used more than once)
+
+=back
+
+=head1 SPECIAL KICKSTART FILE LINES
+
+The KS file is parsed for lines that look like
+I<#<tagE<gt>:<valueE<gt>>.  #include pulls in additional files, while the
+other options set default values (that can still be overridden on the command
+line).
+
+Supported tags:
+
+=over 8
+
+=item B<#include>:F<file>
+
+Include another file - this can be a full path or relative to the kickstart
+file itself.  HTTP/HTTPS URLs are also supported.  Includes can appear more
+than once, including in included files.
+
+=item B<#CPU>:I<cores>
+
+Number of CPU cores
+
+=item B<#RAM>:I<MB>
+
+RAM size in megabytes
+
+=item B<#DISK>:I<GB>
+
+Disk size in gigabytes
+
+=item B<#DISK2>:I<GB>
+
+Second disk size in gigabytes
+
+=item B<#ISO>:F<[pool/]file>
+
+ISO file/volume to use for install
+
+=item B<#OS>:I<OS string>
+
+Operating system (only needed if not autodetected)
+
+=item B<#(NO)SSH>:I<1>
+
+Add/don't add SSH keys
+
+=item B<#(NO)TPM>:I<1>
+
+Add/don't add TPM device
+
+=item B<#(NO)UEFI>:I<1>
+
+Use/don't use UEFI boot
+
+=back
+
+=head1 AUTHOR
+
+Written by Chris Adams
+
+=head1 COPYRIGHT
+
+Copyright 2022 Chris Adams. License: GPLv3
+
+=cut
