@@ -1,0 +1,50 @@
+# post-install script to add IPs to login screen
+%post --erroronfail --interpreter=/bin/bash
+set -e
+cat > /etc/NetworkManager/dispatcher.d/50-issue <<'EOF'
+#!/bin/bash
+
+# Put "up" interfaces in /etc/issue to show the IPs on the console
+
+IF="$1"
+ACTION="$2"
+
+[ -d /etc/issue.d ] || mkdir /etc/issue.d
+file=/etc/issue.d/if-$IF.issue
+
+change=0
+case "$ACTION" in
+  up|dhcp4-change|dhcp6-change|hostname)
+	change=1
+	old=
+	[ -e $file ] && old=$(cat $file)
+	ips=
+	((IP4_NUM_ADDRESSES > 0)) && ips="$ips \\4{$IF}"
+	# don't count link-local that's always present
+	((IP6_NUM_ADDRESSES > 1)) && ips="$ips \\6{$IF}"
+	if [ -n "$ips" -a "$old" != "$IF:$ips" ]; then
+		(echo "$IF:$ips"; echo) > $file
+	fi;;
+
+  down)
+	if [ -e $file ]; then
+		rm $file
+		change=1
+	fi;;
+esac
+[ $change = 1 ] || exit
+
+# reset waiting login prompts to show changes
+kill -1 $(pidof agetty) 2> /dev/null || :
+
+# this can cause systemd to think they're failing too fast, so look for that
+sleep 0.1
+failed=$(systemctl show --failed --property=Id '*getty@tty*.service' | cut -d= -f2-)
+if [ -n "$failed" ]; then
+	systemctl reset-failed $failed
+	systemctl restart $failed
+fi
+exit 0
+EOF
+chmod 0755 /etc/NetworkManager/dispatcher.d/50-issue
+%end

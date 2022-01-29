@@ -154,11 +154,11 @@ my $quiet = opt ("quiet");
 $quiet = 1 if (! defined ($quiet) && opt ("dumpks"));
 
 # find SSH keys to plug in
-my @sshkey;
+my %sshkey;
 if (opt ("ssh")) {
 	if ($ENV{"SSH_AGENT_PID"}) {
 		open (my $sshadd, "-|", qw(ssh-add -L));
-		@sshkey = map {chomp; $_} <$sshadd>;
+		%sshkey = map {chomp; $_ => 1} <$sshadd>;
 		close ($sshadd);
 	}
 	foreach my $key (glob ($ENV{"HOME"} . "/.ssh/id*.pub")) {
@@ -167,7 +167,7 @@ if (opt ("ssh")) {
 			my $key = <$kh>;
 			if ($key =~ /^[a-z]/) {
 				chomp $key;
-				push @sshkey, $key;
+				$sshkey{$key} = 1;
 			}
 			close ($kh);
 		};
@@ -253,9 +253,9 @@ foreach my $line (@ks) {
 	} elsif (opt ("addga") && ($line =~ /^%packages/)) {
 		msg ("Adding guest agent package");
 		$line .= "qemu-guest-agent\n";
-	} elsif (opt ("ssh") && @sshkey && ($line =~ /^rootpw/)) {
+	} elsif (opt ("ssh") && %sshkey && ($line =~ /^rootpw/)) {
 		msg ("Adding SSH keys");
-		foreach my $key (@sshkey) {
+		foreach my $key (sort keys %sshkey) {
 			$line .= "sshkey --username=root \"" . $key . "\"\n";
 		}
 	} elsif ($line =~ /^cdrom/) {
@@ -624,6 +624,17 @@ ks-libvirt - Take a Fedora/CentOS/RHEL kickstart file and make a VM
 =head1 SYNOPSIS
 
 ks-libvirt [options] F<kickstart-file>
+
+At the end of install, if the VM is not shut down with --off and the guest
+agent is not excluded with --noaddga, the script waits until the VM is up and
+an IPv4 address is configured; it will clean any previous SSH host keys for
+that IP and then print the IP, so if you have an SSH key defined, you can do:
+
+=over 8
+
+ssh -l root $(ks-libvirt F<kickstart-file>)
+
+=back
 
 =head1 OPTIONS
 

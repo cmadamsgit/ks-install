@@ -1,0 +1,36 @@
+# Minimal Fedora Rawhide kickstart file
+
+# example default overrides
+#RAM:2048
+#DISK:3
+
+# install source
+url --metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-rawhide&arch=x86_64
+
+# System config
+text
+reboot
+lang en_US.UTF-8
+keyboard --vckeymap=us
+firstboot --disable
+rootpw --plaintext installpw
+timezone --utc America/Chicago
+
+zerombr
+clearpart --initlabel --drives=vda --all
+bootloader --location=mbr --boot-drive=vda
+part /boot --fstype=xfs --size=1024 --ondisk=vda
+part pv.1 --size=2046 --ondisk=vda --grow
+volgroup os pv.1
+logvol / --vgname=os --name=root --fstype=xfs --size=2042 --grow
+
+# don't need the add-ons
+%addon com_redhat_kdump --disable
+%end
+
+%packages
+@^Minimal Install
+%end
+
+# useful post-install script
+#include:inc-post-ips
