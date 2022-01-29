@@ -29,6 +29,7 @@ install -D -m0644 ks-libvirt.1 %{buildroot}%{_mandir}/man1/ks-libvirt.1
 
 %files
 %license LICENSE
+%doc examples
 %{_bindir}/*
 %{_mandir}/man*/*
 
