@@ -6,6 +6,13 @@ ks-libvirt - Take a Fedora/CentOS/RHEL kickstart file and make a VM
 
 ks-libvirt \[options\] `kickstart-file`
 
+At the end of install, if the VM is not shut down with --off and the guest
+agent is not excluded with --noaddga, the script waits until the VM is up and
+an IPv4 address is configured; it will clean any previous SSH host keys for
+that IP and then print the IP, so if you have an SSH key defined, you can do:
+
+> ssh -l root $(ks-libvirt `kickstart-file`)
+
 # OPTIONS
 
 - **--addga | -a**
