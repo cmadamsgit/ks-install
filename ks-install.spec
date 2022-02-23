@@ -22,6 +22,7 @@ Take a Fedora/CentOS/RHEL kickstart file and make a VM
 
 %build
 pod2man ks-libvirt > ks-libvirt.1
+touch --reference=ks-libvirt ks-libvirt.1
 
 %install
 install -D -m0755 ks-libvirt %{buildroot}%{_bindir}/ks-libvirt

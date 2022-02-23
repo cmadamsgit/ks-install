@@ -25,8 +25,11 @@
 # - also needs swtpm-tools for TPM device in VM
 #
 # History:
-# 1.0 - 2022-01-05 - cmadams
-#	first release version, script goes back years
+# 2022-02-22 - cmadams
+# - fix multiple DNS server handling
+#
+# 2022-01-05 - cmadams
+# - first release version, script goes back years
 #
 
 use Modern::Perl qw(2018);
@@ -51,7 +54,7 @@ my %defaults = (
 	addga => 1,
 	cpu => 1,
 	disk => 6,
-	dns => join (",", default_dns ()),
+	dns => [default_dns ()],
 	libvirt => $ENV{"VIRSH_DEFAULT_CONNECT_UID"} || "qemu:///system",
 	mapfile => $ENV{"HOME"} . "/.virtinst-map",
 	net => default_net (),
@@ -71,7 +74,6 @@ foreach my $arg (qw(
 	cpu|c=i
 	disk2=f
 	disk|d=f
-	dns=s
 	dumpks|D!
 	gw=s
 	hostname|h=s
@@ -100,6 +102,7 @@ foreach my $arg (qw(
 }
 # - list/multi options
 foreach my $arg (qw(
+	dns=s
 	virtinst|V=s
     )) {
 	my ($long) = $arg =~ /^([a-z0-9]+)/;
@@ -274,7 +277,7 @@ foreach my $line (@ks) {
 		    " --ip=" . $netinf[0] .
 		    " --netmask=" . $netinf[3] .
 		    " --gateway=" . $netinf[2] .
-		    " --nameserver=" . opt ("dns") .
+		    " --nameserver=" . join (",", @{opt ("dns")}) .
 		    $2 . "\n";
 	}
 }
@@ -351,8 +354,10 @@ close ($ksfh);
 my $anaextra = opt ("anaconda") // "";
 $anaextra = " " . $anaextra if ($anaextra);
 $anaextra .= " " . $serial if ($serial);
-$anaextra .= " ip=" . join (":", @netinf) if ($netset);
-$anaextra .= " nameserver=" . opt ("dns") if ($netset);
+if ($netset) {
+	$anaextra .= " ip=" . join (":", @netinf);
+	$anaextra .= " " . join (" ", map {"nameserver=" . $_} @{opt ("dns")});
+}
 push @source, "--initrd-inject", $ksf,
     "--extra-args", "inst.ks=file:/ks.cfg" . $anaextra;
 
@@ -669,8 +674,8 @@ mostly just useful for testing kickstart RAID handling)
 
 =item B<--dns> I<DNS-IPs>
 
-Set the DNS server(s) (comma separated); default: copy host DNS config when
-IPv4 address is set
+Set the DNS server(s) (can be specified more than once for multiple servers);
+default: copy host DNS config when IPv4 address is set
 
 =item B<--dumpks | -D>
 
