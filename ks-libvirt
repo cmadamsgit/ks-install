@@ -25,6 +25,9 @@
 # - also needs swtpm-tools for TPM device in VM
 #
 # History:
+# 2022-04-15 - cmadams
+# - add UEFI Secure Boot option
+#
 # 2022-02-22 - cmadams
 # - fix multiple DNS server handling
 #
@@ -61,6 +64,7 @@ my %defaults = (
 	os => "detect=on,require=on",
 	pool => "default",
 	ram => 2048,
+	securepath => "/usr/share/edk2/ovmf",
 	serial => 1,
 	ssh => 1,
 );
@@ -89,6 +93,8 @@ foreach my $arg (qw(
 	quiet|q!
 	ram|r=i
 	screen|s!
+	secureboot|B!
+	securepath=s
 	serial|S!
 	ssh!
 	tpm!
@@ -128,6 +134,21 @@ if (-e $cffile) {
 
 # serial console? list both, but the last one is what anaconda will use
 my $serial = 'console=tty0 console=ttyS0,115200' if (opt ("serial"));
+
+# secure boot? make sure we have the needed files
+my @sb;
+if (opt ("secureboot")) {
+	my $sb = opt ("securepath");
+	die "Secure Boot loader not found in ", $sb . "/OVMF_CODE.secboot.fd\n"
+	    if (! -e $sb . "/OVMF_CODE.secboot.fd");
+	die "Secure Boot NVRAM not found in ", $sb . "/OVMF_VARS.secboot.fd\n"
+	    if (! -e $sb . "/OVMF_CODE.secboot.fd");
+	@sb = ("loader=" . $sb . "/OVMF_CODE.secboot.fd",
+	    "nvram.template=" . $sb . "/OVMF_VARS.secboot.fd",
+	    "loader.readonly=yes",
+	    "loader.type=pflash",
+	    "loader.secure=yes");
+}
 
 # read the base file and handle includes up front
 my $ks = shift or pod2usage ("Must supply KS file");
@@ -385,15 +406,20 @@ if (my $vm = eval {$virt->get_domain_by_name ($name)}) {
 }
 
 # want a second disk too?
-my @disk2 = ();
+my @disk2;
 if (opt ("disk2")) {
     @disk2 = ("--disk", "pool=" . opt ("pool") . ",path=" . $name
         . "-2.qcow2,driver.discard=unmap,size=" . opt ("disk2"));
 }
 
 # extra boot config
-my @boot = ();
-push @boot, "uefi" if (opt ("uefi"));
+my (@boot, @smm);
+if (@sb) {
+	push @boot, @sb;
+	@smm = ("--features", "smm.state=on");
+} elsif (opt ("uefi")) {
+	push @boot, "uefi";
+}
 push @boot, "bios.useserial=on" if ($serial);
 @boot = ("--boot", join (",", @boot)) if (@boot);
 
@@ -415,6 +441,7 @@ my @cmd = ("virt-install",
     "--panic", "default",
     "--noreboot",
     @boot,
+    @smm,
 );
 push @cmd, "--quiet" if (! opt ("verbose"));
 push @cmd, "--tpm", "emulator" if (opt ("tpm"));
@@ -655,7 +682,7 @@ other VM management).
 
 Additional anaconda boot arguments
 
-=item B{--config | -C> F<config>
+=item B<--config | -C> F<config>
 
 Config file for defaults; default is $HOME/.virtinst.cf
 
@@ -744,6 +771,15 @@ VM RAM size in megabytes; default is 2048 unless specified in the KS
 =item B<--screen | -s>
 
 Open the VM console screen during install
+
+=item B<--secureboot | -B>
+
+Enable Secure Boot (implies UEFI).
+
+=item B<--securepath> [I<path>]
+
+Specify the path to the Secure Boot loader/NVRAM files (default is
+F</usr/share/edk2/ovmf>)
 
 =item B<--serial | -S>
 
