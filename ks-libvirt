@@ -27,6 +27,7 @@
 # History:
 # 2023-05-06 - cmadams
 # - add "arch" and "machine" options for alternate CPU/system types
+# - recognize "$basearch" in URLs
 #
 # 2022-04-15 - cmadams
 # - add UEFI Secure Boot option
@@ -49,7 +50,7 @@ use LWP::Protocol::https;
 use XML::Simple qw(:strict);
 use Sys::Virt;
 use File::Temp qw(tempfile tempdir);
-use POSIX qw(strftime);
+use POSIX qw(strftime uname);
 
 # Base defaults - order settings are applied is (stop at first match):
 # - command-line options
@@ -248,20 +249,26 @@ foreach my $line (@ks) {
 		} elsif ($line =~ / --mirrorlist=(\S+)/) {
 			if (! ($url = mapurl ($1))) {
 				msg ("Fetching mirrorlist");
-				($url) = grep {/^http/} split (/\n/, get ($1));
+				my $resp = get ($1);
+				die "Got nothing for $1\n" if (! $resp);
+				($url) = urlvar (grep {/^http/}
+				    split (/\n/, $resp));
 			} else {
 				$uchange = 1;
 			}
 		} elsif ($line =~ / --metalink=(\S+)/) {
 			if (! ($url = mapurl ($1))) {
 				msg ("Fetching metalink");
-				my $xml = XMLin (get ($1), KeyAttr => {},
+				my $resp = get ($1);
+				die "Got nothing for $1\n" if (! $resp);
+				my $xml = XMLin ($resp, KeyAttr => {},
 				    ForceArray => ["url"]);
 				foreach my $ent (@{$xml->{"files"}->{"file"}->
 				    {"resources"}->{"url"}}) {
 					if ($ent->{"protocol"} =~ /^http/) {
 						$url = $ent->{"content"};
 						$url =~ s!/repodata/.*!/!;
+						$url = urlvar ($url);
 						last;
 					}
 				}
@@ -604,6 +611,22 @@ sub opt
 	my $key = shift;
 
 	return $cliopt{$key} // $kscfg{$key} // $fileopt{$key} // $defaults{$key};
+}
+
+
+# Handle URLs with variables
+sub urlvar
+{
+	my $in = shift;
+
+	if ($in =~ /(.*)\$basearch\b(.*)/) {
+		my $start = $1;
+		my $end = $2;
+		my $arch = opt ("arch") || (uname)[4];
+		$in = $start . $arch . $end;
+	}
+
+	return $in;
 }
 
 
