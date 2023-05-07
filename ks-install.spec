@@ -1,11 +1,11 @@
 %global forgeurl https://github.com/cmadamsgit/ks-install
 %global commit SETME
-%forgemeta
 
 Name:		ks-install
 Summary:	Take a Fedora/CentOS/RHEL kickstart file and make a VM
 Version:	0
 Release:	0.1%{?dist}
+%forgemeta
 URL:		%{forgeurl}
 Source:		%{forgesource}
 License:	GPLv3
