@@ -25,6 +25,9 @@
 # - also needs swtpm-tools for TPM device in VM
 #
 # History:
+# 2023-05-06 - cmadams
+# - add "arch" and "machine" options for alternate CPU/system types
+#
 # 2022-04-15 - cmadams
 # - add UEFI Secure Boot option
 #
@@ -75,6 +78,7 @@ my (%opts, %cliopt);
 foreach my $arg (qw(
 	addga|a!
 	anaconda|A=s
+	arch=s
 	cpu|c=i
 	disk2=f
 	disk|d=f
@@ -84,6 +88,7 @@ foreach my $arg (qw(
 	ip=s
 	iso|i=s
 	libvirt|l=s
+	machine=s
 	mapfile|m=s
 	name|n=s
 	net|N=s
@@ -423,6 +428,11 @@ if (@sb) {
 push @boot, "bios.useserial=on" if ($serial);
 @boot = ("--boot", join (",", @boot)) if (@boot);
 
+# alternate architecure or machine?
+my @machine;
+push @machine, "--arch", opt ("arch") if (opt ("arch"));
+push @machine, "--machine", opt ("machine") if (opt ("machine"));
+
 # Do it! Always power off when done to know when it's finished
 my @cmd = ("virt-install",
     "--connect", opt ("libvirt"),
@@ -441,6 +451,7 @@ my @cmd = ("virt-install",
     "--panic", "default",
     "--noreboot",
     @boot,
+    @machine,
     @smm,
 );
 push @cmd, "--quiet" if (! opt ("verbose"));
@@ -682,6 +693,12 @@ other VM management).
 
 Additional anaconda boot arguments
 
+=item B<--arch> I<architecture>
+
+Use an alternate CPU architecture (this usually will require additional
+qemu-system-<arch> to be installed); this probably doesn't work with
+secureboot
+
 =item B<--config | -C> F<config>
 
 Config file for defaults; default is $HOME/.virtinst.cf
@@ -731,6 +748,10 @@ F<pool/volume> for an ISO already in a storage pool.
 =item B<--libvirt | -l> I<URL>
 
 Connection to libvirt; default is $VIRTSH_DEFAULT_CONNECT_UID or qemu:///system
+
+=item B<--machine> I<machine>
+
+Use an alternate machine type rather than the default (e.g. q35 for x86_64)
 
 =item B<--mapfile | -m> F<file>
 

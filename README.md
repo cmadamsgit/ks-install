@@ -25,6 +25,12 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
     Additional anaconda boot arguments
 
+- **--arch** _architecture_
+
+    Use an alternate CPU architecture (this usually will require additional
+    qemu-system-&lt;arch> to be installed); this probably doesn't work with
+    secureboot
+
 - **--config | -C** `config`
 
     Config file for defaults; default is $HOME/.virtinst.cf
@@ -74,6 +80,10 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 - **--libvirt | -l** _URL_
 
     Connection to libvirt; default is $VIRTSH\_DEFAULT\_CONNECT\_UID or qemu:///system
+
+- **--machine** _machine_
+
+    Use an alternate machine type rather than the default (e.g. q35 for x86\_64)
 
 - **--mapfile | -m** `file`
 
