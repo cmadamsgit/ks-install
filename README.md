@@ -25,7 +25,7 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
     Additional anaconda boot arguments
 
-- B{--config | -C> `config`
+- **--config | -C** `config`
 
     Config file for defaults; default is $HOME/.virtinst.cf
 
@@ -44,8 +44,8 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
 - **--dns** _DNS-IPs_
 
-    Set the DNS server(s) (comma separated); default: copy host DNS config when
-    IPv4 address is set
+    Set the DNS server(s) (can be specified more than once for multiple servers);
+    default: copy host DNS config when IPv4 address is set
 
 - **--dumpks | -D**
 
@@ -114,6 +114,15 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 - **--screen | -s**
 
     Open the VM console screen during install
+
+- **--secureboot | -B**
+
+    Enable Secure Boot (implies UEFI).
+
+- **--securepath** \[_path_\]
+
+    Specify the path to the Secure Boot loader/NVRAM files (default is
+    `/usr/share/edk2/ovmf`)
 
 - **--serial | -S**
 
