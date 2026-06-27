@@ -25,6 +25,12 @@
 # - also needs swtpm-tools for TPM device in VM
 #
 # History:
+# 2026-06-27 - cmadams
+# - restructure some things to make it easer/cleaner
+# - update for newer libvirt/qemu things
+# - add ability to disable graphics console (also disables sound)
+# - handle any number of disks rather than just 1 or 2
+#
 # 2023-05-06 - cmadams
 # - add "arch" and "machine" options for alternate CPU/system types
 # - recognize "$basearch" in URLs
@@ -62,15 +68,17 @@ my %defaults = (
 	cpu => 1,
 	disk => 6,
 	dns => [default_dns ()],
+	graphics => 1,
 	libvirt => $ENV{"VIRSH_DEFAULT_CONNECT_UID"} || "qemu:///system",
 	mapfile => $ENV{"HOME"} . "/.virtinst-map",
 	net => default_net (),
 	os => "detect=on,require=on",
 	pool => "default",
 	ram => 2048,
-	securepath => "/usr/share/edk2/ovmf",
 	serial => 1,
 	ssh => 1,
+	sshscan => 1,
+	vsock => 1,
 );
 
 # Handle command-line options
@@ -81,9 +89,9 @@ foreach my $arg (qw(
 	anaconda|A=s
 	arch=s
 	cpu|c=i
-	disk2=f
-	disk|d=f
+	disk|d=f@
 	dumpks|D!
+	graphics!
 	gw=s
 	hostname|h=s
 	ip=s
@@ -100,13 +108,14 @@ foreach my $arg (qw(
 	ram|r=i
 	screen|s!
 	secureboot|B!
-	securepath=s
 	serial|S!
 	ssh!
+	sshscan!
 	tpm!
 	uefi|u!
 	vdelete!
 	verbose|v!
+	vsock!
     )) {
 	my ($long) = $arg =~ /^([a-z0-9]+)/;
 	$cliopt{$long} = undef;
@@ -135,26 +144,11 @@ my %fileopt;
 if (-e $cffile) {
 	my $cf = Config::Tiny->read ($cffile);
 	my $fileopt = $cf->{"_"};
-	%fileopt = %$fileopt;
+	%fileopt = %$fileopt if ($fileopt);
 }
 
 # serial console? list both, but the last one is what anaconda will use
 my $serial = 'console=tty0 console=ttyS0,115200' if (opt ("serial"));
-
-# secure boot? make sure we have the needed files
-my @sb;
-if (opt ("secureboot")) {
-	my $sb = opt ("securepath");
-	die "Secure Boot loader not found in ", $sb . "/OVMF_CODE.secboot.fd\n"
-	    if (! -e $sb . "/OVMF_CODE.secboot.fd");
-	die "Secure Boot NVRAM not found in ", $sb . "/OVMF_VARS.secboot.fd\n"
-	    if (! -e $sb . "/OVMF_CODE.secboot.fd");
-	@sb = ("loader=" . $sb . "/OVMF_CODE.secboot.fd",
-	    "nvram.template=" . $sb . "/OVMF_VARS.secboot.fd",
-	    "loader.readonly=yes",
-	    "loader.type=pflash",
-	    "loader.secure=yes");
-}
 
 # read the base file and handle includes up front
 my $ks = shift or pod2usage ("Must supply KS file");
@@ -227,7 +221,7 @@ $netinf[4] = opt ("hostname") if (opt ("hostname"));
 
 # Go through the kickstart file and check/change some things
 my ($url, $cdrom, %kscfg);
-my %tags = map {$_ => 1} qw(CPU DISK DISK2 ISO OS RAM SSH TPM UEFI);
+my %tags = map {$_ => 1} qw(ARCH CPU DISK ISO MACHINE OS RAM SSH TPM UEFI);
 foreach my $line (@ks) {
 	if (my ($tag, $val) = $line =~ /^#([A-Z0-9]+):(\S.*)$/) {
 		# Save tags to override defaults (but command-line
@@ -240,7 +234,13 @@ foreach my $line (@ks) {
 		} else {
 			die "Unknown tag in kickstart\n", $line, "\n";
 		}
-		$kscfg{$tag} = $val;
+		if ($kscfg{$tag}) {
+			$kscfg{$tag} = [$kscfg{$tag}]
+			    if (ref ($kscfg{$tag}) eq "ARRAY");
+			push @{$kscfg{$tag}}, $val;
+		} else {
+			$kscfg{$tag} = $val;
+		}
 	} elsif ($line =~ /^url /) {
 		# This may be an install source, also map to local repos
 		my $uchange = 0;
@@ -417,61 +417,86 @@ if (my $vm = eval {$virt->get_domain_by_name ($name)}) {
 	}
 }
 
-# want a second disk too?
-my @disk2;
-if (opt ("disk2")) {
-    @disk2 = ("--disk", "pool=" . opt ("pool") . ",path=" . $name
-        . "-2.qcow2,driver.discard=unmap,size=" . opt ("disk2"));
+# Build up the virt-install options
+my @inst = (
+    "--connect", opt ("libvirt"),
+    "--name", $name,
+    @source,
+    "--vcpus", opt ("cpu"),
+    "--memballoon", "virtio",
+    "--network", "bridge=" . opt ("net"),
+    "--os-variant", opt ("os"),
+    "--panic", "default",
+    "--rng", "builtin",
+    "--security", "type=dynamic",
+    "--watchdog", "default",
+    # always power off when done to know when it's finished
+    "--noreboot",
+);
+
+# handle disk(s)
+my $dopts = opt ("disk");
+$dopts = [$dopts] if (ref ($dopts) ne "ARRAY");
+foreach my $d (@$dopts) {
+	my @d;
+	push @d, "pool=" . opt ("pool");
+	push @d, "driver.discard=unmap";
+	push @d, "size=" . $d;
+	push @inst, "--disk", join (",", @d);
 }
 
 # extra boot config
-my (@boot, @smm);
-if (@sb) {
-	push @boot, @sb;
-	@smm = ("--features", "smm.state=on");
-} elsif (opt ("uefi")) {
+my @boot;
+if (opt ("uefi")) {
 	push @boot, "uefi";
+	if (opt ("secureboot")) {
+		push @boot, qw(
+		    firmware.feature0.name=secure-boot
+		    firmware.feature0.enabled=yes
+		    firmware.feature1.name=enrolled-keys
+		    firmware.feature1.enabled=yes
+		);
+		push @inst, qw(--features smm.state=on);
+	} else {
+		push @boot, qw(
+		    firmware.feature0.name=secure-boot
+		    firmware.feature0.enabled=no
+		);
+	}
 }
 push @boot, "bios.useserial=on" if ($serial);
-@boot = ("--boot", join (",", @boot)) if (@boot);
+push @inst, "--boot", join (",", @boot) if (@boot);
 
 # alternate architecure or machine?
-my @machine;
-push @machine, "--arch", opt ("arch") if (opt ("arch"));
-push @machine, "--machine", opt ("machine") if (opt ("machine"));
+push @inst, "--arch", opt ("arch") if (opt ("arch"));
+push @inst, "--machine", opt ("machine") if (opt ("machine"));
 
-# Do it! Always power off when done to know when it's finished
-my @cmd = ("virt-install",
-    "--connect", opt ("libvirt"),
-    "--name", $name,
-    "--memory", opt ("ram"),
-    "--vcpus", opt ("cpu"),
-    "--security", "type=dynamic",
-    "--os-variant", opt ("os"),
-    @source,
-    "--disk", "pool=" . opt ("pool") . ",path=" . $name . ".qcow2,driver.discard=unmap,size=" . opt ("disk"),
-    @disk2,
-    "--network", "bridge=" . opt ("net"),
-    "--watchdog", "default",
-    "--memballoon", "virtio",
-    "--rng", "/dev/urandom",
-    "--panic", "default",
-    "--noreboot",
-    @boot,
-    @machine,
-    @smm,
-);
-push @cmd, "--quiet" if (! opt ("verbose"));
-push @cmd, "--tpm", "emulator" if (opt ("tpm"));
-if (opt ("screen")) {
-	push @cmd, "--autoconsole", "text" if ($serial);
-} else {
-	push @cmd, "--noautoconsole", "--wait";
+if (! opt ("graphics")) {
+	push @inst, "--graphics", "none";
+	push @inst, "--sound", "none";
 }
-push @cmd, @{opt ("virtinst")};
+
+push @inst, "--quiet" if (! opt ("verbose"));
+push @inst, "--tpm", "default" if (opt ("tpm"));
+push @inst, "--vsock", "cid.auto=yes" if (opt ("vsock"));
+if (opt ("screen")) {
+	push @inst, "--autoconsole", "text" if ($serial);
+} else {
+	push @inst, "--noautoconsole", "--wait";
+}
+
+my @ram;
+push @ram, "currentMemory=" . opt ("ram");
+push @ram, "maxMemory=" . opt ("ram") * 16;
+push @ram, "maxMemory.slots=16";
+push @inst, "--memory", join (",", @ram);
+
+push @inst, @{opt ("virtinst")};
+
+# Do it!
 msg ("Installing");
 my $istart = time;
-system (@cmd);
+system ("virt-install", @inst);
 die "virt-install failed\n" if (($? >> 8) != 0);
 my $itook = time - $istart;
 msg ("Took ", int ($itook / 60), ":", sprintf ("%02s", $itook % 60));
@@ -508,26 +533,40 @@ while (! $vmip && sleep (1)) {
 		}
 	}
 }
-# - get SSH ready to go
-my $sshgen = fork;
-if (! $sshgen) {
-	open (STDOUT, ">", "/dev/null") if (! opt ("verbose"));
-	open (STDERR, ">", "/dev/null") if (! opt ("verbose"));
-	exec ("ssh-keygen", "-R", $vmip);
-}
-waitpid ($sshgen, 0);
-while (1) {
-	my $sshscan = fork;
-	if (! $sshscan) {
-		open (STDOUT, ">>", $ENV{"HOME"} . "/.ssh/known_hosts");
+$vm = $virt = undef;
+
+my $hinf = $vmip;
+if (opt ("sshscan")) {
+	# - get SSH ready to go
+	my $sshgen = fork;
+	if (! $sshgen) {
+		open (STDOUT, ">", "/dev/null") if (! opt ("verbose"));
 		open (STDERR, ">", "/dev/null") if (! opt ("verbose"));
-		exec ("ssh-keyscan", $vmip);
+		system ("ssh-keygen", "-R", $vmip);
+		system ("ssh-keygen", "-R", "qemu/" . $name) if (opt ("vsock"));
+		exit;
 	}
-	waitpid ($sshscan, 0);
-	last if (($? >> 8) == 0);
-	sleep (1);
+	waitpid ($sshgen, 0);
+	my $khosts = $ENV{"HOME"} . "/.ssh/known_hosts";
+	while (1) {
+		my $sshscan = fork;
+		if (! $sshscan) {
+			open (STDOUT, ">>", $khosts);
+			open (STDERR, ">", "/dev/null") if (! opt ("verbose"));
+			exec ("ssh-keyscan", "-q", $vmip);
+		}
+		waitpid ($sshscan, 0);
+		last if (($? >> 8) == 0);
+		sleep (1);
+	}
+	if (opt ("vsock")) {
+		my $qvm = quotemeta ($vmip);
+		system ("perl -pi -e 's(^$qvm )($vmip,qemu/$name )' $khosts");
+		$hinf = "qemu/" . $name;
+	}
 }
-print $vmip, "\n";
+print $hinf, "\n";
+exit;
 
 
 # Find the default bridge
@@ -732,12 +771,8 @@ VM CPU cores; default is 1
 
 =item B<--disk | -d> I<GB>
 
-VM disk size in gigabytes; default is 6
-
-=item B<--disk2> I<GB>
-
-VM second disk size in gigabytes; default is to not use a second disk (this is
-mostly just useful for testing kickstart RAID handling)
+VM disk size in gigabytes; default is 6. Can be specified more than once to
+create additional disks
 
 =item B<--dns> I<DNS-IPs>
 
@@ -747,6 +782,10 @@ default: copy host DNS config when IPv4 address is set
 =item B<--dumpks | -D>
 
 Generate a modified kickstart file and dump to standard out (don't build VM)
+
+=item B<--graphics>
+
+Add a graphics console; default is to do this, use B<--nographics> to disable
 
 =item B<--gw> I<IPv4-gateway>
 
@@ -820,11 +859,6 @@ Open the VM console screen during install
 
 Enable Secure Boot (implies UEFI).
 
-=item B<--securepath> [I<path>]
-
-Specify the path to the Secure Boot loader/NVRAM files (default is
-F</usr/share/edk2/ovmf>)
-
 =item B<--serial | -S>
 
 Add a serial console; default is to do this, use B<--noserial> to disable
@@ -833,6 +867,11 @@ Add a serial console; default is to do this, use B<--noserial> to disable
 
 Add found SSH key(s) to the installed system; default is to do this, use
 B<--nossh> to disable
+
+=item B<--sshscan>
+
+Add VM's SSH host keys after boot; default is to do this, use
+B<--nosshscan> to disable
 
 =item B<--tpm>
 
@@ -854,6 +893,10 @@ Be more verbose
 =item B<--virtinst | -V> I<arguments>
 
 Additional virt-install arguments (can be used more than once)
+
+=item B<--vsock>
+
+Enable vsock for SSH access; default is to do this, use B<--vsock> to disable
 
 =back
 
@@ -886,10 +929,6 @@ RAM size in megabytes
 
 Disk size in gigabytes
 
-=item B<#DISK2>:I<GB>
-
-Second disk size in gigabytes
-
 =item B<#ISO>:F<[pool/]file>
 
 ISO file/volume to use for install
@@ -909,6 +948,14 @@ Add/don't add TPM device
 =item B<#(NO)UEFI>:I<1>
 
 Use/don't use UEFI boot
+
+=item B<#ARCH>:I<architecture>
+
+CPU architecture (for emulated system)
+
+=item B<#MACHINE>:I<type>
+
+Machine type (for emulated system)
 
 =back
 
