@@ -41,12 +41,8 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
 - **--disk | -d** _GB_
 
-    VM disk size in gigabytes; default is 6
-
-- **--disk2** _GB_
-
-    VM second disk size in gigabytes; default is to not use a second disk (this is
-    mostly just useful for testing kickstart RAID handling)
+    VM disk size in gigabytes; default is 6. Can be specified more than once to
+    create additional disks
 
 - **--dns** _DNS-IPs_
 
@@ -56,6 +52,10 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 - **--dumpks | -D**
 
     Generate a modified kickstart file and dump to standard out (don't build VM)
+
+- **--graphics**
+
+    Add a graphics console; default is to do this, use **--nographics** to disable
 
 - **--gw** _IPv4-gateway_
 
@@ -129,11 +129,6 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
     Enable Secure Boot (implies UEFI).
 
-- **--securepath** \[_path_\]
-
-    Specify the path to the Secure Boot loader/NVRAM files (default is
-    `/usr/share/edk2/ovmf`)
-
 - **--serial | -S**
 
     Add a serial console; default is to do this, use **--noserial** to disable
@@ -142,6 +137,11 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 
     Add found SSH key(s) to the installed system; default is to do this, use
     **--nossh** to disable
+
+- **--sshscan**
+
+    Add VM's SSH host keys after boot; default is to do this, use
+    **--nosshscan** to disable
 
 - **--tpm**
 
@@ -163,6 +163,10 @@ that IP and then print the IP, so if you have an SSH key defined, you can do:
 - **--virtinst | -V** _arguments_
 
     Additional virt-install arguments (can be used more than once)
+
+- **--vsock**
+
+    Enable vsock for SSH access; default is to do this, use **--vsock** to disable
 
 # SPECIAL KICKSTART FILE LINES
 
@@ -191,10 +195,6 @@ Supported tags:
 
     Disk size in gigabytes
 
-- **#DISK2**:_GB_
-
-    Second disk size in gigabytes
-
 - **#ISO**:`[pool/]file`
 
     ISO file/volume to use for install
@@ -215,10 +215,18 @@ Supported tags:
 
     Use/don't use UEFI boot
 
+- **#ARCH**:_architecture_
+
+    CPU architecture (for emulated system)
+
+- **#MACHINE**:_type_
+
+    Machine type (for emulated system)
+
 # AUTHOR
 
 Written by Chris Adams
 
 # COPYRIGHT
 
-Copyright 2022 Chris Adams. License: GPLv3
+Copyright 2022-2026 Chris Adams. License: GPLv3
